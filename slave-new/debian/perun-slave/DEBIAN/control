@@ -1,0 +1,9 @@
+Package: perun-slave
+Version: 3.0.0-0.0.75
+Architecture: all
+Maintainer: Michal Prochazka <michalp@ics.muni.cz>
+Installed-Size: 159
+Depends: bash (>= 2.05a-11), sed (>= 3.02-8), grep (>= 2.4.2-3), coreutils (>= 5.0-5), perl-base
+Section: utils
+Priority: optional
+Description: Perun slave scripts
