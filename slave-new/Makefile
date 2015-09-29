@@ -28,7 +28,7 @@ meta:
 
 $(processes):
 	@echo "Generating deb package for $@..."
-	@cd $@ && CONF=$@ envsubst < ../templates/Makefile > Makefile
+	@cd $@ && NAME=$@ envsubst < ../templates/Makefile > Makefile
 	@cd $@ && if [ -d conf ]; then cat ../templates/makefile_conf_part >> Makefile; fi
 	@cd $@ && if [ -d lib ]; then cat ../templates/makefile_lib_part >> Makefile; fi
 	cd $@ && DEBEMAIL=$(maintainer_email) DEBFULLNAME=$(maintainer_name) dh_make -s -i -y -n -p "$(package_prefix_name)$@_`cat version`" -t "$(realpath templates/dh_make)" --createorig
