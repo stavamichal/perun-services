@@ -1,0 +1,68 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use perunServicesInit;
+use perunServicesUtils;
+use Text::Unidecode;
+use JSON::XS;
+
+local $::SERVICE_NAME = "o365";
+local $::PROTOCOL_VERSION = "3.0.0";
+my $SCRIPT_VERSION = "3.0.0";
+
+perunServicesInit::init;
+my $DIRECTORY = perunServicesInit::getDirectory;
+my $data = perunServicesInit::getFlatData;
+
+#Constants
+our $A_FIRST_NAME;               *A_FIRST_NAME =                  \'urn:perun:user:attribute-def:core:firstName';
+our $A_MIDDLE_NAME;              *A_MIDDLE_NAME =                 \'urn:perun:user:attribute-def:core:middleName';
+our $A_LAST_NAME;                *A_LAST_NAME =                   \'urn:perun:user:attribute-def:core:lastName';
+our $A_TITLE_BEFORE;             *A_TITLE_BEFORE =                \'urn:perun:user:attribute-def:core:titleBefore';
+our $A_TITLE_AFTER;              *A_TITLE_AFTER =                 \'urn:perun:user:attribute-def:core:titleAfter';
+our $A_DISPLAY_NAME;             *A_DISPLAY_NAME =                \'urn:perun:user:attribute-def:core:displayName';
+our $A_USER_LOGIN;               *A_USER_LOGIN =                  \'urn:perun:user_facility:attribute-def:virt:login';
+#our $A_USER_LICENSE_ASS;
+
+my $outputData = {
+						 members => [],
+					 };
+my $members = {};
+
+sub processMemberData {
+	my $mData = shift;
+	my %memberAttributes = attributesToHash $mData->getAttributes;
+	my $login = $memberAttributes{$A_USER_LOGIN};
+
+	my @licences = ();
+	push @licences, "nejakaLicence01";
+	push @licences, "nejakaLicence02";
+
+	my $member = {
+			           first_name   => $memberAttributes{$A_FIRST_NAME} eq 'null' ? '' : $memberAttributes{$A_FIRST_NAME},
+		             middle_name  => $memberAttributes{$A_MIDDLE_NAME} eq 'null' ? '' : $memberAttributes{$A_MIDDLE_NAME},
+			           last_name    => $memberAttributes{$A_LAST_NAME} eq 'null' ? '' : $memberAttributes{$A_LAST_NAME},
+								 display_name => $memberAttributes{$A_DISPLAY_NAME} eq 'null' ? '' : $memberAttributes{$A_DISPLAY_NAME},
+		             title_before => $memberAttributes{$A_TITLE_BEFORE} eq 'null' ? '' : $memberAttributes{$A_TITLE_BEFORE},
+                 title_after  => $memberAttributes{$A_TITLE_AFTER} eq 'null' ? '' : $memberAttributes{$A_TITLE_AFTER},
+                 login        => $login eq 'null' ? '' : $login,
+								 licenseAssignment => \@licences,
+	};
+	$members->{$login} = $member;
+}
+
+foreach my $mData (($data->getChildElements)[1]->getChildElements) {
+	processMemberData $mData
+}
+
+for my $login (keys %{$members}) {
+	my $member = $members->{$login};
+	push @{$outputData->{'members'}}, $member;
+}
+
+my $out_file_name = "$DIRECTORY/$::SERVICE_NAME";
+
+open FILE,">$out_file_name" or die "Cannot open $out_file_name: $! \n";
+print FILE JSON::XS->new->utf8->pretty->encode($outputData);
+close (FILE);
+perunServicesInit::finalize;
