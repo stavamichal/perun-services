@@ -4,6 +4,26 @@ use LWP::UserAgent;
 use MIME::Base64;
 use JSON;
 
+use Data::Dumper;  #FIXME
+
+#local $Data::Dumper::Terse = 1;
+#			local $Data::Dumper::Indent = 0;
+			local $Data::Dumper::Useqq = 1;
+
+			{ no warnings 'redefine';
+				sub Data::Dumper::qquote {
+					my $s = shift;
+					return "'$s'";
+				}
+			}
+binmode STDOUT, ":utf8";
+binmode STDERR, ":utf8";
+
+
+
+my %testUsers = ( 'petrilak.m@czechglobe.cz' => 1, 'rocek.a@czechglobe.cz' => 1, 'pokryvka.f@czechglobe.cz' => 1, 'korbela.m@czechglobe.cz' => 1, 'strakova.k@czechglobe.cz' => 1);  #FIXME
+
+
 my $licenses = {};
 my $photos = {};
 
@@ -14,8 +34,9 @@ my $o365UserMapper = {};
 # Perun
 my @listOfUsersPerun;
 my $perunUsersMapper = {};
-my $filenameUsersPerun = '${WORK_DIR}/$FILE_USERS';
-my $filenamePhotosPerun = '${WORK_DIR}/$FILE_PHOTOS';
+my $localUsers = {'Admin@czechglobe.cz' => 1,  'perun.service@czechglobe.cz' => 1};
+my $filenameUsersPerun = "/tmp/users.json";  #FIXME
+my $filenamePhotosPerun = '/tmp/photos.csv';  #FIXME
 
 # call API endpoint to obtain all licenses and load them into $licenses structure
 my $ua = LWP::UserAgent->new;
@@ -23,7 +44,7 @@ my $server_endpoint = "https://graph.microsoft.com/v1.0/subscribedSkus";
 
 my $headers = HTTP::Headers->new;
 $headers->content_type("application/json");
-$headers->authorization('$ACCESS_TOKEN');
+$headers->authorization(`cat /tmp/o365-access-token`);
 
 my $req = HTTP::Request->new('GET', $server_endpoint, $headers);
 my $resp = $ua->request($req);
@@ -38,13 +59,15 @@ if ($resp->is_success) {
 }
 
 # call API endpoint to obtain users from o365 and load them into @listOfUsersActual array
-$server_endpoint = "https://graph.microsoft.com/v1.0/users";
+$server_endpoint = 'https://graph.microsoft.com/v1.0/users?$top=999';
 $req = HTTP::Request->new('GET', $server_endpoint, $headers);
 
 $resp = $ua->request($req);
 if ($resp->is_success) {
     my $content = $resp->decoded_content;
     @listOfUsersActual = @{JSON::XS->new->utf8->decode ($content)->{value}};
+		#print Dumper \@listOfUsersActual, "\n\n\n";  #FIXME
+
 
     # change accountEnabled from integer to boolean
     foreach my $member (@listOfUsersActual) {
@@ -139,12 +162,22 @@ foreach my $userPerun (@listOfUsersPerun) {
                 # call API endpoint for user licenses update
                 $server_endpoint = "https://graph.microsoft.com/v1.0/users/$userPrincipalName/assignLicense";
 
-                $req = HTTP::Request->new('POST', $server_endpoint, $headers, JSON::XS->new->utf8->encode->($updateLicenses));
+								if($testUsers{$userPrincipalName}) {
+
+								print Dumper(JSON::XS->new->utf8->encode($updateLicenses)), "\n";
+#=test
+                $req = HTTP::Request->new('POST', $server_endpoint, $headers, JSON::XS->new->utf8->encode($updateLicenses));
 
                 $resp = $ua->request($req);
                 if ($resp->is_error) {
                     die $resp->status_line;
                 }
+#=cut
+								}
+
+
+
+
             }
 
             # update user fields if they are not equal
@@ -158,12 +191,29 @@ foreach my $userPerun (@listOfUsersPerun) {
 
                 # call API endpoint for user update
                 $server_endpoint = "https://graph.microsoft.com/v1.0/users/$userPrincipalName";
-                $req = HTTP::Request->new('PATCH', $server_endpoint, $headers, JSON::XS->new->utf8->encode->($userPerun));
+
+
+
+
+
+								if($testUsers{$userPrincipalName}) {
+								print "\n\nUpdating user $userPrincipalName: \n";
+								print Dumper $userPerun;
+
+
+#=test
+                $req = HTTP::Request->new('PATCH', $server_endpoint, $headers, JSON::XS->new->utf8->encode($userPerun));
 
                 $resp = $ua->request($req);
                 if ($resp->is_error) {
                     die $resp->status_line;
                 }
+#=cut
+								}
+
+
+
+
             }
 
             my $photoBase64Perun = $photos->{$userPrincipalName};
@@ -174,21 +224,41 @@ foreach my $userPerun (@listOfUsersPerun) {
                 $req = HTTP::Request->new('GET', $server_endpoint, $headers);
 
                 $resp = $ua->request($req);
+								my $photo; #photo stored in o365
                 if ($resp->is_success) {
                     my $photo = encode_base64($resp->decoded_content);
+								} elsif ($resp->code == 404) {
+									$photo = ""; #photo is not stored in o365
+								} else {
+									die $resp->status_line;
+								}
 
-                    if ($photo && $photo ne $photoBase64Perun) {
-                        # call API endpoint for photo update
-                        $server_endpoint = "https://graph.microsoft.com/v1.0/users/$userPrincipalName/photo/\$value";
-                        $headers->content_type("image/jpeg");
-                        $req = HTTP::Request->new('PUT', $server_endpoint, $headers, decode_base64(photoBase64Perun));
+									if ($photo ne $photoBase64Perun) {
+											# call API endpoint for photo update
+											$server_endpoint = "https://graph.microsoft.com/v1.0/users/$userPrincipalName/photo/\$value";
+											$headers->content_type("image/jpeg");
 
-                        $resp = $ua->request($req);
-                        if ($resp->is_error) {
-                            die $resp->status_line;
-                        }
-                    }
-                }
+
+
+
+
+											if($testUsers{$userPrincipalName}) {
+											print "Update photo for $userPrincipalName \n";
+#=test
+											$req = HTTP::Request->new('PUT', $server_endpoint, $headers, decode_base64(photoBase64Perun));
+
+											$resp = $ua->request($req);
+											if ($resp->is_error) {
+													die $resp->status_line;
+											}
+#=cut
+											}
+
+
+
+
+
+									}
             }
         }
     }
@@ -207,19 +277,33 @@ foreach my $userPerun (keys %{$perunUsersMapper}) {
 # when o365 returns user, who is not returned from Perun system, change its status to disabled
 foreach my $userActual (@listOfUsersActual) {
     my $userPrincipalName = $userActual->{'userPrincipalName'};
-    if($o365UserMapper->{$userPrincipalName}) {
+    if($o365UserMapper->{$userPrincipalName} && ! $localUsers->{$userPrincipalName}) {
         $userActual->{'accountEnabled'} = 'false';
         delete $userActual->{assignedLicenses};
 
         # call API endpoint for user update
         $server_endpoint = "https://graph.microsoft.com/v1.0/users/$o365UserMapper->{$userPrincipalName}";
         $headers->content_type("application/json");
-        $req = HTTP::Request->new('PATCH', $server_endpoint, $headers, JSON::XS->new->utf8->encode->($userActual));
+
+
+
+
+				if($testUsers{$userPrincipalName}) {
+				print "Disable user: $userPrincipalName \n";
+=test
+        $req = HTTP::Request->new('PATCH', $server_endpoint, $headers, JSON::XS->new->utf8->encode($userActual));
 
         $resp = $ua->request($req);
         if ($resp->is_error) {
             die $resp->status_line;
         }
+=cut
+				}
+
+
+
+
+
     }
 }
 
@@ -232,5 +316,6 @@ foreach my $userPerun (@listOfUsersPerun) {
     }
 }
 if (@missingUsers) {
+    print "O365 should contain these users: @missingUsers \n";  #FIXME
     die "O365 should contain these users: @missingUsers \n";
 }

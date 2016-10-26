@@ -20,7 +20,7 @@ my $data = perunServicesInit::getHierarchicalData;
 
 our $A_USER_FIRST_NAME;           *A_USER_FIRST_NAME =           \'urn:perun:user:attribute-def:core:firstName';
 our $A_USER_LAST_NAME;            *A_USER_LAST_NAME =            \'urn:perun:user:attribute-def:core:lastName';
-our $A_USER_DISPLAY_NAME;         *A_USER_DISPLAY_NAME =         \'urn:perun:user:attribute-def:core:displayName';
+#our $A_USER_DISPLAY_NAME;         *A_USER_DISPLAY_NAME =         \'urn:perun:user:attribute-def:core:displayName';
 our $A_USER_PHOTOS;               *A_USER_PHOTOS =               \'urn:perun:user:attribute-def:def:photos';
 our $A_USER_FACILITY_LOGIN;       *A_USER_FACILITY_LOGIN =       \'urn:perun:user_facility:attribute-def:virt:login';
 our $A_FACILITY_USAGE_LOCATION;   *A_FACILITY_USAGE_LOCATION =   \'urn:perun:facility:attribute-def:def:o365-usageLocation';
@@ -52,6 +52,7 @@ foreach my $mail (sort keys %{$members}) {
 
 	if(defined $member->{'photo'}) {
 		print FILE_PHOTOS "$mail,$member->{'photo'}", "\n";
+		delete $member->{'photo'};
 	}
 
 	push @{$outputData->{'value'}}, $member;
@@ -99,7 +100,7 @@ sub processMembers {
 			my $member = {
 				accountEnabled => \1,
 				assignedLicenses => \@licenses,
-				displayName => $memberData->{$A_USER_DISPLAY_NAME},
+				displayName => $memberData->{$A_USER_FIRST_NAME} . " " . $memberData->{$A_USER_LAST_NAME},
 				givenName => $memberData->{$A_USER_FIRST_NAME},
 				mail => $mail,
 				surname => $memberData->{$A_USER_LAST_NAME},
