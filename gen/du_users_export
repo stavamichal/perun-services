@@ -7,19 +7,30 @@ use Perun::Agent;
 use JSON::XS;
 use Tie::IxHash;
 
+sub processResource;
+sub processMember;
+sub processUserAssociatedServiceUsers;
+sub processServiceUserAssociatedUsers;
+sub processGroup;
+sub processVo;
+sub processVoAdmins;
+sub processVoGroups;
+sub exportVoData;
+sub exportFacilityData;
+
 our $SERVICE_NAME = "du_users_export";
 our $PROTOCOL_VERSION = "3.0.0";
-my $SCRIPT_VERSION = "3.1.0";
 
 perunServicesInit::init;
 my $DIRECTORY = perunServicesInit::getDirectory;
-my $data = perunServicesInit::getDataWithGroups;
 
-my $agent = perunServicesInit->getAgent;
-my $vosAgent = $agent->getVosAgent;
-my $usersAgent = $agent->getUsersAgent;
+#-------------------------------------------------------------------------
+#---------------------------Constants-------------------------------------
+#-------------------------------------------------------------------------
 
-#Constants
+our @ALLOWED_STATUSES = ( "VALID", "EXPIRED", "SUSPENDED" );
+our $DIR_NAME = "$DIRECTORY/data";
+
 our $A_USER_MAIL;                *A_USER_MAIL =                \'urn:perun:user:attribute-def:def:preferredMail';
 our $A_USER_LOGIN_EINFRA;        *A_USER_LOGIN_EINFRA =        \'urn:perun:user:attribute-def:def:login-namespace:einfra';
 our $A_RESOURCE_NAME;            *A_RESOURCE_NAME =            \'urn:perun:resource:attribute-def:core:name';
@@ -37,6 +48,12 @@ our $A_MR_DATALIMIT;             *A_MR_DATALIMIT =             \'urn:perun:membe
 our $A_MR_DATAQUOTA;             *A_MR_DATAQUOTA =             \'urn:perun:member_resource:attribute-def:def:dataQuota';
 our $A_MR_FILESLIMIT;            *A_MR_FILESLIMIT =            \'urn:perun:member_resource:attribute-def:def:filesLimit';
 our $A_MR_FILESQUOTA;            *A_MR_FILESQUOTA =            \'urn:perun:member_resource:attribute-def:def:filesQuota';
+
+#new attributes for quotas
+our $A_MR_DATAQUOTAS;            *A_MR_DATAQUOTAS =            \'urn:perun:member_resource:attribute-def:def:dataQuotas';
+our $A_MR_FILEQUOTAS;            *A_MR_FILEQUOTAS =            \'urn:perun:member_resource:attribute-def:def:fileQuotas';
+our $A_R_DEFAULT_DATA_QUOTAS;    *A_R_DEFAULT_DATA_QUOTAS =    \'urn:perun:resource:attribute-def:def:defaultDataQuotas';
+our $A_R_DEFAULT_FILE_QUOTAS;    *A_R_DEFAULT_FILE_QUOTAS =    \'urn:perun:resource:attribute-def:def:defaultFileQuotas';
 
 our $A_U_KERBEROS_LOGINS;        *A_U_KERBEROS_LOGINS =        \'urn:perun:user:attribute-def:virt:kerberosLogins';
 our $A_U_SHIBBOLETH_EXT_SOURCES; *A_U_SHIBBOLETH_EXT_SOURCES = \'urn:perun:user:attribute-def:virt:shibbolethExtSources';
@@ -56,253 +73,593 @@ our $A_USER_ID;                  *A_USER_ID =                  \'urn:perun:user:
 our $A_USER_FIRSTNAME;           *A_USER_FIRSTNAME =           \'urn:perun:user:attribute-def:core:firstName';
 our $A_USER_LASTNAME;            *A_USER_LASTNAME =            \'urn:perun:user:attribute-def:core:lastName';
 our $A_USER_SERVICE_USER;        *A_USER_SERVICE_USER =        \'urn:perun:user:attribute-def:core:serviceUser';
+our $A_USER_SPONSORED_USER;      *A_USER_SPONSORED_USER =      \'urn:perun:user:attribute-def:core:sponsoredUser';
 
 our $A_VO_TOEMAIL;               *A_VO_TOEMAIL =               \'urn:perun:vo:attribute-def:def:toEmail';
 our $A_VO_FROMEMAIL;             *A_VO_FROMEMAIL =             \'urn:perun:vo:attribute-def:def:fromEmail';
 our $A_VO_NAME;                  *A_VO_NAME =                  \'urn:perun:vo:attribute-def:core:name';
 
-my %attributesByLogin;
-my %attributesByVo;
+#-------------------------------------------------------------------------
+#---------------------------Agents----------------------------------------
+#-------------------------------------------------------------------------
 
-my %facilityAttributes = attributesToHash $data->getAttributes;
-my $facilityName = $facilityAttributes{$A_F_NAME};
+my $agent = Perun::Agent->new();
+our $vosAgent = $agent->getVosAgent;
+our $usersAgent = $agent->getUsersAgent;
+our $membersAgent = $agent->getMembersAgent;
+our $facilitiesAgent = $agent->getFacilitiesAgent;
+our $servicesAgent = $agent->getServicesAgent;
+our $resourcesAgent = $agent->getResourcesAgent;
+our $groupsAgent = $agent->getGroupsAgent;
+our $attributesAgent = $agent->getAttributesAgent;
 
-my @resourcesData = $data->getChildElements;
-foreach my $rData (@resourcesData) {
-	my %resourcesAttributes = attributesToHash $rData->getAttributes;
-	my @membersData = ($rData->getChildElements)[1]->getChildElements;
-	foreach my $mData (@membersData) {
-		my %memberAttributes = attributesToHash $mData->getAttributes;
-		unless(defined $attributesByLogin{$memberAttributes{$A_USER_LOGIN_EINFRA}}) {
+#-------------------------------------------------------------------------
+#-----------------------Prepare phase-------------------------------------
+#-------------------------------------------------------------------------
 
-			#prepare kerberos logins in required format
-			my @kerberosLogins = ();
-			for my $kerberosLogin (@{$memberAttributes{$A_U_KERBEROS_LOGINS}}) {
-				my $realm = $kerberosLogin;
-				$realm =~ s/^.*@//;
-				push @kerberosLogins, { "src" => $realm, 
-																"id"  => $kerberosLogin, 
-															};
-			}
+#create workign dir
+mkdir $DIR_NAME or die "Cannot create $DIR_NAME";
 
-			#prepare shibboleth logins in required format
-			my @shibbolethLogins = ();
-			for my $idpIdentifier (keys %{$memberAttributes{$A_U_SHIBBOLETH_EXT_SOURCES}}) {
-				push @shibbolethLogins, { "src" => $idpIdentifier, 
-																	"id"  => $memberAttributes{$A_U_SHIBBOLETH_EXT_SOURCES}->{$idpIdentifier},
-																};
-			}			
+#prepare service and facility object
+our $service = perunServicesInit::getService;
+our $facility = perunServicesInit::getFacility;
+our $facilityId = $facility->getId;
+our $facilityName = $facility->getName;
 
-			#prepare all associated users (TODO)
-			my @associatedUsers = ();
-			if($memberAttributes{$A_USER_SERVICE_USER}) {
-				my @specificUsers = $usersAgent->getUsersBySpecificUser(specificUser => $memberAttributes{$A_USER_ID});
-				my @richAssocUsersWithAttributes = $usersAgent->getRichUsersFromListOfUsersWithAttributes(users => \@specificUsers);
-				foreach my $richUser (@richAssocUsersWithAttributes) {
-				
-					#prepare attributes to hash
-					my $assocUserAttrs = {};
-					foreach my $attribute (@{$richUser->{'_userAttributes'}}) {
-						$assocUserAttrs->{$attribute->{'namespace'} . ':' . $attribute->{'friendlyName'}} = $attribute->{'value'};
-					}
+#prepare main working structures
+our $attributesByLogin = {};
+our $attributesByVo = {};
 
-					#prepare kerberos logins in required format
-					my @assocUserKerberosLogins = ();
-					for my $assocUserKerberosLogin (@{$assocUserAttrs->{$A_U_KERBEROS_LOGINS}}) {
-						my $realm = $assocUserKerberosLogin;
-						$realm =~ s/^.*@//;
-						push @assocUserKerberosLogins, { "src" => $realm, 
-						                                 "id"  => $assocUserKerberosLogin, 
-						                               };
-					}
+#-------------------------------------------------------------------------
+#---------------------------Subs------------------------------------------
+#-------------------------------------------------------------------------
 
-					my @assocUserShibbolethLogins = ();
-					for my $idpIdentifier (keys %{$assocUserAttrs->{$A_U_SHIBBOLETH_EXT_SOURCES}}) {
-						push @assocUserShibbolethLogins, { "src" => $idpIdentifier, 
-						                                   "id"  => $assocUserAttrs->{$A_U_SHIBBOLETH_EXT_SOURCES}->{$idpIdentifier},
-						                                 };
-					}
 
-					push @associatedUsers, 
-										{
-											"PerunUserID" => $richUser->{'_id'},
-											"FirstName" => $richUser->{'_firstName'} || "",
-											"LastName" => $richUser->{'_lastName'} || "",
-											"PreferredMail" => $assocUserAttrs->{$A_USER_MAIL},
-											"LoginInEINFRA" => $assocUserAttrs->{$A_USER_LOGIN_EINFRA} ? $assocUserAttrs->{$A_USER_LOGIN_EINFRA}  : "",
-											"KerberosPrincipals" => \@assocUserKerberosLogins,
-											"ShibbolethPrincipals" => \@assocUserShibbolethLogins,
-										};
-				}
-			}
-			#End of associated users structure
+### NAME: processResource
+###
+### param: $resource - the resource to process
+###-----------------------------------------------------------------------
+### Process assigned groups and allwed users of the resource and add them
+### to the structure for an export.
+###-----------------------------------------------------------------------
+sub processResource {
+	my $resource = shift;
 
-			$attributesByLogin{$memberAttributes{$A_USER_LOGIN_EINFRA}} = 
-								{
-									"LoginInEINFRA"   => $memberAttributes{$A_USER_LOGIN_EINFRA},
-									"PreferredMail"   => $memberAttributes{$A_USER_MAIL},
-									"IsServiceUser"   => $memberAttributes{$A_USER_SERVICE_USER},
-									"AssociatedUsers" => \@associatedUsers,
-									"Kerberos"        => \@kerberosLogins,
-									"Shibboleth"      => \@shibbolethLogins,
-									"PerunUserID"     => $memberAttributes{$A_USER_ID},
-									"FirstName"       => $memberAttributes{$A_USER_FIRSTNAME} || "",
-									"LastName"        => $memberAttributes{$A_USER_LASTNAME} || "",
-									"ResearchGroup"   => defined $memberAttributes{$A_U_RESEARCH_GROUP} ? $memberAttributes{$A_U_RESEARCH_GROUP} : "",
-									"Organization"    => defined $memberAttributes{$A_U_ORGANIZATION} ? $memberAttributes{$A_U_ORGANIZATION} : "",
-								};
+	#resource and vo required attributes
+	my $resourceAttributeHardQuotaData = $attributesAgent->getAttribute( resource => $resource->getId, attributeName => $A_R_HARD_QUOTA_DATA );
+	my $resourceAttributeSoftQuotaData = $attributesAgent->getAttribute( resource => $resource->getId, attributeName => $A_R_SOFT_QUOTA_DATA );
+	my $resourceAttributeHardQuotaFiles = $attributesAgent->getAttribute( resource => $resource->getId, attributeName => $A_R_HARD_QUOTA_FILE );
+	my $resourceAttributeSoftQuotaFiles = $attributesAgent->getAttribute( resource => $resource->getId, attributeName => $A_R_SOFT_QUOTA_FILE );
+	my $resourceAttributeQuotasData = $attributesAgent->getAttribute( resource => $resource->getId, attributeName => $A_R_DEFAULT_DATA_QUOTAS );
+	my $resourceAttributeQuotasFiles = $attributesAgent->getAttribute( resource => $resource->getId, attributeName => $A_R_DEFAULT_FILE_QUOTAS );
+	my $resourceAttributeUnixGroupName = $attributesAgent->getAttribute( resource => $resource->getId, attributeName => $A_RESOURCE_UNIX_GROUP_NAME );
+	my $resourceAttributeUnixGID = $attributesAgent->getAttribute( resource => $resource->getId, attributeName => $A_RESOURCE_UNIX_GID );
+	my $resourceAttributeHomeMountPoint = $attributesAgent->getAttribute( resource => $resource->getId, attributeName => $A_R_FS_HOME_MOUNT_POINT );
+	my $resourceAttributeVolume = $attributesAgent->getAttribute( resource => $resource->getId, attributeName => $A_R_FS_VOLUME );
+	my $resourceAttributeVoName = $attributesAgent->getAttribute( resource => $resource->getId, attributeName =>  $A_R_VO_NAME );
+	my $voAttributeName = $attributesAgent->getAttribute( vo => $resource->getVoId, attributeName => $A_VO_NAME );
+	my $voAttributeToEmail = $attributesAgent->getAttribute( vo => $resource->getVoId, attributeName => $A_VO_TOEMAIL );
+	my $voAttributeFromEmail = $attributesAgent->getAttribute( vo => $resource->getVoId, attributeName => $A_VO_FROMEMAIL );
 
+	#set unix group info for this resource
+	my $unixGroups = [
+		{
+			"UnixGroupName"  => $resourceAttributeUnixGroupName->getValue,
+	    "UnixGID"        => $resourceAttributeUnixGID->getValue,
+	  }
+	];
+
+	#if this resource has not assigned du_users_export service, skip it
+	my @assignedServices = $resourcesAgent->getAssignedServices( resource => $resource->getId );
+	my $duExportAssigned = 0;
+	foreach my $ser ( @assignedServices ) {
+		if( $ser->getId == $service->getId ) {
+			$duExportAssigned = 1;
+			last;
 		}
+	}
+	if(!$duExportAssigned) { return; }
 
-		push @{$attributesByLogin{$memberAttributes{$A_USER_LOGIN_EINFRA}}->{"Resources"}}, 
-							{ 
-								"Name"              => $resourcesAttributes{$A_RESOURCE_NAME},
-								"PerunResourceID"   => $resourcesAttributes{$A_RESOURCE_ID},
-								"UID"               => $memberAttributes{$A_USER_FACILITY_UID},
-								"Login"             => $memberAttributes{$A_USER_LOGIN_EINFRA},
-								"DataLimit"         => defined $memberAttributes{$A_MR_DATALIMIT} ? $memberAttributes{$A_MR_DATALIMIT} : $resourcesAttributes{$A_R_HARD_QUOTA_DATA},
-								"DataQuota"         => defined $memberAttributes{$A_MR_DATAQUOTA} ? $memberAttributes{$A_MR_DATAQUOTA} : $resourcesAttributes{$A_R_SOFT_QUOTA_DATA},
-								"FilesLimit"        => defined $memberAttributes{$A_MR_FILESLIMIT} ? $memberAttributes{$A_MR_FILESLIMIT} : $resourcesAttributes{$A_R_HARD_QUOTA_FILE},
-								"FilesQuota"        => defined $memberAttributes{$A_MR_FILESQUOTA} ? $memberAttributes{$A_MR_FILESQUOTA} : $resourcesAttributes{$A_R_SOFT_QUOTA_FILE},
-								"Status"            => $memberAttributes{$A_M_STATUS},
-							};
+	#Process all assigned groups and prepare strucutre of all distinct allowed Members on resource
+	my @assignedGroups = $resourcesAgent->getAssignedGroups( resource => $resource->getId );
+	my %allowedMembers;
+	foreach my $group ( @assignedGroups ) {
+		my %groupAllowedMembers = processGroup $group, $resource, $resourceAttributeVoName->getValue, $unixGroups;
+		%allowedMembers = ( %allowedMembers, %groupAllowedMembers );
 	}
 
-	my @unixGroups = ( { "UnixGroupName"  => $resourcesAttributes{$A_RESOURCE_UNIX_GROUP_NAME},
-											 "UnixGID"        => $resourcesAttributes{$A_RESOURCE_UNIX_GID},
-										 }
-									 );
-
-	my @groupsData = ($rData->getChildElements)[0]->getChildElements;
-	foreach my $gData (@groupsData) {
-		my %groupAttributes = attributesToHash $gData->getAttributes;
-
-		if($groupAttributes{$A_GROUP_UNIX_GROUP_NAME}) {
-			push @unixGroups, 
-						{ 
-							"UnixGroupName" => $groupAttributes{$A_GROUP_UNIX_GROUP_NAME},
-							"UnixGID"       => $groupAttributes{$A_GROUP_UNIX_GID},
-						};
-		}
-
-	unless($attributesByVo{$resourcesAttributes{$A_R_VO_NAME}}->{"Groups"}->{$groupAttributes{$A_GROUP_NAME}}) {
-		my @logins;
-		foreach my $groupMembersData (($gData->getChildElements)[1]->getChildElements) {
-			my %groupMemberAttributes = attributesToHash $groupMembersData->getAttributes;
-			push @logins, { "LoginInEINFRA"  => $groupMemberAttributes{$A_USER_LOGIN_EINFRA} };
-		}
-		$attributesByVo{$resourcesAttributes{$A_R_VO_NAME}}->{"Groups"}->{$groupAttributes{$A_GROUP_NAME}}->{"Members"} = \@logins;
+	my $otherNeededAttributes = {
+		$A_R_HARD_QUOTA_DATA => $resourceAttributeHardQuotaData,
+		$A_R_SOFT_QUOTA_DATA => $resourceAttributeSoftQuotaData,
+		$A_R_HARD_QUOTA_FILE => $resourceAttributeHardQuotaFiles,
+		$A_R_SOFT_QUOTA_FILE => $resourceAttributeSoftQuotaFiles
+	};
+	#Process all allowed Members on resource
+	foreach my $member (values %allowedMembers) {
+		processMember $member, $resource, $otherNeededAttributes;
 	}
-	$attributesByVo{$resourcesAttributes{$A_R_VO_NAME}}->{"Groups"}->{$groupAttributes{$A_GROUP_NAME}}->{"Resources"}->{$resourcesAttributes{$A_RESOURCE_NAME}} = 1;
-
-	}
-
-	$attributesByVo{$resourcesAttributes{$A_R_VO_NAME}}->{"PerunVOID"} = $resourcesAttributes{$A_RESOURCE_VO_ID};
-	$attributesByVo{$resourcesAttributes{$A_R_VO_NAME}}->{"PerunVOLongName"} = $resourcesAttributes{$A_VO_NAME};
-	$attributesByVo{$resourcesAttributes{$A_R_VO_NAME}}->{"FromEmail"} = $resourcesAttributes{$A_VO_FROMEMAIL};
-	$attributesByVo{$resourcesAttributes{$A_R_VO_NAME}}->{"ToEmail"} = $resourcesAttributes{$A_VO_TOEMAIL};
-
-	push @{$attributesByVo{$resourcesAttributes{$A_R_VO_NAME}}->{"Resources"}}, 
-					{
-						"Name"              => $resourcesAttributes{$A_RESOURCE_NAME},
-						"FSHomeMountPoint"  => $resourcesAttributes{$A_R_FS_HOME_MOUNT_POINT},
-						"FSVolume"          => $resourcesAttributes{$A_R_FS_VOLUME},
-						"PerunResourceID"   => $resourcesAttributes{$A_RESOURCE_ID},
-						"DefaultDataLimit"  => $resourcesAttributes{$A_R_HARD_QUOTA_DATA},
-						"DefaultDataQuota"  => $resourcesAttributes{$A_R_SOFT_QUOTA_DATA},
-						"DefaultFilesLimit" => $resourcesAttributes{$A_R_HARD_QUOTA_FILE},
-						"DefaultFilesQuota" => $resourcesAttributes{$A_R_SOFT_QUOTA_FILE},
-						"UnixGroups"        => \@unixGroups,
-					};
+			
+	#Add Vo specific information from Resource to the structure of Vos
+	$attributesByVo->{$resourceAttributeVoName->getValue}->{"PerunVOID"} = $resource->getVoId;
+	$attributesByVo->{$resourceAttributeVoName->getValue}->{"PerunVOLongName"} = $voAttributeName->getValue;
+	$attributesByVo->{$resourceAttributeVoName->getValue}->{"FromEmail"} = $voAttributeFromEmail->getValue;
+	$attributesByVo->{$resourceAttributeVoName->getValue}->{"ToEmail"} = $voAttributeToEmail->getValue;
+	push @{$attributesByVo->{$resourceAttributeVoName->getValue}->{"Resources"}}, 
+	  {
+	    "Name"               => $resource->getName,
+	    "FSHomeMountPoint"   => $resourceAttributeHomeMountPoint->getValue,
+	    "FSVolume"           => $resourceAttributeVolume->getValue,
+	    "PerunResourceID"    => $resource->getId,
+	    "DefaultDataLimit"   => $resourceAttributeHardQuotaData->getValue,
+	    "DefaultDataQuota"   => $resourceAttributeSoftQuotaData->getValue,
+	    "DefaultFilesLimit"  => $resourceAttributeHardQuotaFiles->getValue,
+	    "DefaultFilesQuota"  => $resourceAttributeSoftQuotaFiles->getValue,
+	    "DefaultDataQuotas"  => defined $resourceAttributeQuotasData ? $resourceAttributeQuotasData : {},
+	    "DefaultFilesQuotas" => defined $resourceAttributeQuotasFiles ? $resourceAttributeQuotasFiles : {};
+	    "UnixGroups"         => $unixGroups,
+	  };
 }
 
-my $struc = {};
-$struc->{"FileType"} = "du_users_export";
-my @users = values %attributesByLogin;
-$struc->{"Users"} = \@users;
+### NAME: processMember
+###
+### param:  $member       - id of the member
+### param:  $resource     - id of the resource
+### param:  $otherNeededAttributes - other required attributes
+###-----------------------------------------------------------------------
+### Process one of the allowed members and add information about him to
+### the structure of data.
+###-----------------------------------------------------------------------
+sub processMember {
+	my $member = shift;
+	my $resource = shift;
+	my $otherNeededAttributes = shift;
 
-my $dirName = "$DIRECTORY/data";
-mkdir $dirName or die "Cannot create $dirName";
+	#Prepare better structure of member and user attributes to better work with them
+	my %mapOfMemberAndUserAttributes;
+	my @userAttributes = $member->getUserAttributes;
+	my @memberAttributes = $member->getMemberAttributes;
+	foreach my $attribute (@userAttributes) {
+		$mapOfMemberAndUserAttributes{$attribute->getNamespace . ':' . $attribute->getFriendlyName} = $attribute;
+	}
+	foreach my $attribute (@memberAttributes) {
+		$mapOfMemberAndUserAttributes{$attribute->getNamespace . ':' . $attribute->getFriendlyName} = $attribute;
+	}
 
-my $fileName = "$DIRECTORY/data/$facilityName-$SERVICE_NAME";
-open FILE,">$fileName" or die "Cannot open $fileName: $! \n";
-print FILE JSON::XS->new->utf8->pretty->encode($struc);
-close FILE;
+	#Prepare values of speicific attributes for member
+	my $login = $mapOfMemberAndUserAttributes{$A_USER_LOGIN_EINFRA}->getValue;
+	my $mail = defined $mapOfMemberAndUserAttributes{$A_USER_MAIL} ? $mapOfMemberAndUserAttributes{$A_USER_MAIL}->getValue : undef;
+	my @kerberoslogins = defined $mapOfMemberAndUserAttributes{$A_U_KERBEROS_LOGINS} ? @{$mapOfMemberAndUserAttributes{$A_U_KERBEROS_LOGINS}->getValue} : [];
+	my %shibbolethextsource = defined $mapOfMemberAndUserAttributes{$A_U_SHIBBOLETH_EXT_SOURCES} ? %{$mapOfMemberAndUserAttributes{$A_U_SHIBBOLETH_EXT_SOURCES}->getValue} : {};
+	my $researchgroup = defined $mapOfMemberAndUserAttributes{$A_U_RESEARCH_GROUP} ? $mapOfMemberAndUserAttributes{$A_U_RESEARCH_GROUP}->getValue : undef;
+	my $organization = defined $mapOfMemberAndUserAttributes{$A_U_ORGANIZATION} ? $mapOfMemberAndUserAttributes{$A_U_ORGANIZATION}->getValue : undef;
+	my $isserviceuser = defined $mapOfMemberAndUserAttributes{$A_USER_SERVICE_USER} ? $mapOfMemberAndUserAttributes{$A_USER_SERVICE_USER}->getValue : undef;
+	my $issponsoreduser = defined $mapOfMemberAndUserAttributes{$A_USER_SPONSORED_USER} ? $mapOfMemberAndUserAttributes{$A_USER_SPONSORED_USER}->getValue : undef;
+	my $uid = defined $mapOfMemberAndUserAttributes{$A_USER_FACILITY_UID} ? $mapOfMemberAndUserAttributes{$A_USER_FACILITY_UID}->getValue : undef;
+	my $datalimit = defined $mapOfMemberAndUserAttributes{$A_MR_DATALIMIT} ? $mapOfMemberAndUserAttributes{$A_MR_DATALIMIT}->getValue : undef; 
+	my $dataquota = defined $mapOfMemberAndUserAttributes{$A_MR_DATAQUOTA} ? $mapOfMemberAndUserAttributes{$A_MR_DATAQUOTA}->getValue : undef;
+	my $fileslimit = defined $mapOfMemberAndUserAttributes{$A_MR_FILESLIMIT} ? $mapOfMemberAndUserAttributes{$A_MR_FILESLIMIT}->getValue : undef;
+	my $filesquota = defined $mapOfMemberAndUserAttributes{$A_MR_FILESQUOTA} ? $mapOfMemberAndUserAttributes{$A_MR_FILESQUOTA}->getValue : undef;
+	my $dataquotas = defined $mapOfMemberAndUserAttributes{$A_MR_DATAQUOTAS} ? $mapOfMemberAndUserAttributes{$A_MR_DATAQUOTAS} : {};
+	my $filesquotas = defined $mapOfMemberAndUserAttributes{$A_MR_FILEQUOTAS} ? $mapOfMemberAndUserAttributes{$A_MR_FILEQUOTAS} : {}
 
-for my $vo (keys %attributesByVo) {
-	my $voID = $attributesByVo{$vo}->{"PerunVOID"};
+	#login already exists in strucutre, do not add these attributes again, they are still the same
+	unless(defined $attributesByLogin->{$login}) {	
+		#prepare kerberos logins in required format
+		my $kerberosLoginsStructure = [];
+		for my $kerberosLogin (@kerberoslogins) {
+			my $realm = $kerberosLogin;
+			$realm =~ s/^.*@//;
+			push @$kerberosLoginsStructure, { "src" => $realm, "id"  => $kerberosLogin };
+		}
 
-	#Prepare VO Admins (TODO)
+		#prepare shibboleth logins in required format
+		my $shibbolethLoginsStructure = [];
+		for my $idpIdentifier (keys %shibbolethextsource) {
+			push @$shibbolethLoginsStructure, { "src" => $idpIdentifier, "id"  => $shibbolethextsource{$idpIdentifier} };
+		}
+
+		my $associatedUsers = [];
+		my $associatedServiceUsers = [];
+		#process associated users only if this user is service user
+		if($isserviceuser || $issponsoreduser) { 
+			$associatedUsers = processServiceUserAssociatedUsers $member; 
+		} else {
+			$associatedServiceUsers = processUserAssociatedServiceUsers $member; 
+		}
+
+		#Add new attributes for new login entry to the structure
+		$attributesByLogin->{$login} = 
+		  {
+			  "LoginInEINFRA"     => $login,
+			  "PreferredMail"     => $mail || "",
+			  "IsServiceUser"     => $isserviceuser,
+			  "IsSponsoredUser"   => $issponsoreduser,
+			  "AssociatedUsers"   => $associatedUsers,
+			  "ServiceIdentities" => $associatedServiceUsers,
+			  "Kerberos"          => $kerberosLoginsStructure,
+			  "Shibboleth"        => $shibbolethLoginsStructure,
+			  "PerunUserID"       => $member->getUserId,
+			  "FirstName"         => $member->getFirstName,
+			  "LastName"          => $member->getLastName,
+			  "ResearchGroup"     => $researchgroup || "",
+			  "Organization"      => $organization || "",
+			};
+	}
+
+	#Add information about member->resource specific information for this login to the structure
+	push @{$attributesByLogin->{$login}->{"Resources"}}, 
+	  { 
+		  "Name"              => $resource->getName,
+		  "PerunResourceID"   => $resource->getId,
+		  "UID"               => $uid,
+		  "Login"             => $login,
+		  "DataLimit"         => $datalimit || $otherNeededAttributes->{$A_R_HARD_QUOTA_DATA}->getValue,
+		  "DataQuota"         => $dataquota || $otherNeededAttributes->{$A_R_SOFT_QUOTA_DATA}->getValue, 
+		  "FilesLimit"        => $fileslimit || $otherNeededAttributes->{$A_R_HARD_QUOTA_FILE}->getValue,
+		  "FilesQuota"        => $filesquota || $otherNeededAttributes->{$A_R_SOFT_QUOTA_FILE}->getValue,
+		  "DataQuotas"        => $dataquotas,
+		  "FileQuotas"        => $filesquotas,
+		  "Status"            => $member->getStatus,
+		};
+}
+
+### NAME: processUserAssociatedServiceUsers
+###
+### param:  $members         - id of the not-service member
+### return: @serviceUsers    - service users to this user
+###-----------------------------------------------------------------------
+### Process all needed information about associated service users to this
+### non-service user.
+###-----------------------------------------------------------------------
+sub processUserAssociatedServiceUsers {
+	my $member = shift;
+
+	my $associatedUsers = [];
+	
+	#get all associated users for this member
+	my @users = $usersAgent->getSpecificUsersByUser(user => $member->getUserId);
+	#convert them to the users with attributes
+	my @richAssocUsersWithAttributes = $usersAgent->getRichUsersFromListOfUsersWithAttributes(users => \@users);
+	#for each of them prepare data to the structure
+	foreach my $richUser (@richAssocUsersWithAttributes) {
+		#prepare attributes to hash for better working with them
+		my $assocUserAttrs = {};
+		foreach my $attribute (@{$richUser->{'_userAttributes'}}) {
+			$assocUserAttrs->{$attribute->{'namespace'} . ':' . $attribute->{'friendlyName'}} = $attribute->{'value'};
+		}
+
+		#prepare kerberos logins in required format
+		my $assocUserKerberosLogins = [];
+		for my $assocUserKerberosLogin (@{$assocUserAttrs->{$A_U_KERBEROS_LOGINS}}) {
+			my $realm = $assocUserKerberosLogin;
+			$realm =~ s/^.*@//;
+			push @$assocUserKerberosLogins, { "src" => $realm, "id"  => $assocUserKerberosLogin };
+		}
+
+		#prepare shibboleth logins in required format
+		my $assocUserShibbolethLogins = [];
+		for my $idpIdentifier (keys %{$assocUserAttrs->{$A_U_SHIBBOLETH_EXT_SOURCES}}) {
+			push @$assocUserShibbolethLogins, { "src" => $idpIdentifier, "id"  => $assocUserAttrs->{$A_U_SHIBBOLETH_EXT_SOURCES}->{$idpIdentifier} };
+		}
+
+		#add associated user to the array of all associated users
+		push @$associatedUsers, 
+			{
+			  "PerunUserID" => $richUser->{'_id'},
+				"FirstName" => $richUser->{'_firstName'} || "",
+				"LastName" => $richUser->{'_lastName'} || "",
+				"IsServiceUser" => $richUser->{'_serviceUser'},
+		    "IsSponsoredUser" => $richUser->{'_sponsoredUser'},
+				"PreferredMail" => $assocUserAttrs->{$A_USER_MAIL},
+			  "LoginInEINFRA" => $assocUserAttrs->{$A_USER_LOGIN_EINFRA} || "",
+				"KerberosPrincipals" => $assocUserKerberosLogins,
+				"ShibbolethPrincipals" => $assocUserShibbolethLogins,
+			};
+	}
+
+	return $associatedUsers;
+}
+
+
+### NAME: processServiceUserAssociatedUsers
+###
+### param:  $members         - id of the service member
+### return: @associatedUsers - associated users to this service user
+###-----------------------------------------------------------------------
+### Process all needed information about associated users to this service
+### user (we want to know who takes care about this service user).
+###-----------------------------------------------------------------------
+sub processServiceUserAssociatedUsers {
+	my $member = shift;
+
+	my $associatedUsers = [];
+	
+	#get all associated users for this member
+	my @users = $usersAgent->getUsersBySpecificUser(specificUser => $member->getUserId);
+	#convert them to the users with attributes
+	my @richAssocUsersWithAttributes = $usersAgent->getRichUsersFromListOfUsersWithAttributes(users => \@users);
+	#for each of them prepare data to the structure
+	foreach my $richUser (@richAssocUsersWithAttributes) {
+		#prepare attributes to hash for better working with them
+		my $assocUserAttrs = {};
+		foreach my $attribute (@{$richUser->{'_userAttributes'}}) {
+			$assocUserAttrs->{$attribute->{'namespace'} . ':' . $attribute->{'friendlyName'}} = $attribute->{'value'};
+		}
+
+		#prepare kerberos logins in required format
+		my $assocUserKerberosLogins = [];
+		for my $assocUserKerberosLogin (@{$assocUserAttrs->{$A_U_KERBEROS_LOGINS}}) {
+			my $realm = $assocUserKerberosLogin;
+			$realm =~ s/^.*@//;
+			push @$assocUserKerberosLogins, { "src" => $realm, "id"  => $assocUserKerberosLogin };
+		}
+
+		#prepare shibboleth logins in required format
+		my $assocUserShibbolethLogins = [];
+		for my $idpIdentifier (keys %{$assocUserAttrs->{$A_U_SHIBBOLETH_EXT_SOURCES}}) {
+			push @$assocUserShibbolethLogins, { "src" => $idpIdentifier, "id"  => $assocUserAttrs->{$A_U_SHIBBOLETH_EXT_SOURCES}->{$idpIdentifier} };
+		}
+
+		#add associated user to the array of all associated users
+		push @$associatedUsers, 
+			{
+			  "PerunUserID" => $richUser->{'_id'},
+				"FirstName" => $richUser->{'_firstName'} || "",
+				"LastName" => $richUser->{'_lastName'} || "",
+				"PreferredMail" => $assocUserAttrs->{$A_USER_MAIL},
+			  "LoginInEINFRA" => $assocUserAttrs->{$A_USER_LOGIN_EINFRA} || "",
+				"KerberosPrincipals" => $assocUserKerberosLogins,
+				"ShibbolethPrincipals" => $assocUserShibbolethLogins,
+			};
+	}
+
+	return $associatedUsers;
+}
+
+### NAME: processGroup
+###
+### param:  $group          - id of the group
+### param:  $resource       - id of the resource
+### param:  $voName         - vo name attribute
+### param:  $unixGroups     - list of unix group structure
+### return: %allowedMembers - allowed members in group
+###-----------------------------------------------------------------------
+### Process the group assigned to the resource, set specific information
+### to the structure.
+###-----------------------------------------------------------------------
+sub processGroup {
+	my $group = shift;
+	my $resource = shift;
+	my $voName = shift;
+	my $unixGroups = shift;
+
+	my %allowedMembers;
+	#Group-required Attributes
+	my $groupAttributeUnixGroupName = $attributesAgent->getAttribute( group => $group->getId, resource => $resource->getId, attributeName => $A_GROUP_UNIX_GROUP_NAME );
+	my $groupAttributeUnixGID = $attributesAgent->getAttribute( group => $group->getId, resource => $resource->getId, attributeName => $A_GROUP_UNIX_GID ); 
+
+	if($groupAttributeUnixGroupName->getValue) {
+		push @$unixGroups, 
+		  { 
+		    "UnixGroupName" => $groupAttributeUnixGroupName->getValue,
+		    "UnixGID"       => $groupAttributeUnixGID->getValue,
+		  };
+	}
+
+	#User, User-Facility, Member, Member-Resource required Attributes
+	my @requiredAttrNames = ( 
+	  $A_USER_LOGIN_EINFRA, 
+	  $A_U_KERBEROS_LOGINS, 
+	  $A_U_SHIBBOLETH_EXT_SOURCES, 
+	  $A_USER_MAIL, 
+	  $A_U_RESEARCH_GROUP, 
+	  $A_U_ORGANIZATION,
+	  $A_USER_SERVICE_USER,
+		$A_USER_SPONSORED_USER,
+	  $A_USER_FACILITY_UID,
+	  $A_MR_DATALIMIT,
+	  $A_MR_DATAQUOTA,
+	  $A_MR_FILESLIMIT,
+	  $A_MR_FILESQUOTA
+	);
+
+	#Get all Members of the group with allowed statuses and specific attributes
+	my @members = $membersAgent->getCompleteRichMembers( group => $group->getId, resource => $resource->getId, attrsNames => \@requiredAttrNames, allowedStatuses => \@ALLOWED_STATUSES);
+	
+	#Array of all existing logins in this group (in structured format)
+	my $loginsOfMembersInGroup = [];
+	foreach my $member ( @members ) {
+		my $login;
+		my @userAttributes = $member->getUserAttributes;
+		#Find login attribute in all users attributes of the member
+		foreach my $attribute (@userAttributes) {
+			my $nameOfAttribute = $attribute->getNamespace . ':' . $attribute->getFriendlyName;
+			if($nameOfAttribute eq $A_USER_LOGIN_EINFRA) {
+				$login = $attribute->getValue;
+				last;
+			}
+		}
+		#If login not found, skip this member at all
+		unless($login) {
+			return; 
+		}
+		#If login found, add this member to all alowed members array with login as key
+		$allowedMembers{$login} = $member;
+		#Also add to the array of logins in this group
+		push @$loginsOfMembersInGroup, { "LoginInEINFRA"  => $login };
+	}
+
+	#Add GROUP specific data to the structure
+	unless($attributesByVo->{$voName}->{"Groups"}->{$group->getName}) {
+		$attributesByVo->{$voName}->{"Groups"}->{$group->getName}->{"Members"} = $loginsOfMembersInGroup;
+	}
+	$attributesByVo->{$voName}->{"Groups"}->{$group->getName}->{"Resources"}->{$resource->getName} = 1;
+
+	return %allowedMembers;
+}
+
+### NAME: processVo
+###
+### param:  $vo       - id of the vo 
+###-----------------------------------------------------------------------
+### Process the vo (all needed information about it) to the strucutre 
+### and export it to the JSON FILE.
+###-----------------------------------------------------------------------
+sub processVo {
+	my $vo = shift;
+
+	#prepare vo admins for VO
+	my $voAdmins = processVoAdmins $vo;	
+	
+	#prepare groups for VO
+	my $groups = processVoGroups $vo;
+
+	#create record for VO to the structure
+	my $voStruc = {};
+	$voStruc->{"FileType"} = "du_vo_export";
+	$voStruc->{"Name"} = $vo;
+	$voStruc->{"LongName"} = $attributesByVo->{$vo}->{"PerunVOLongName"};
+	$voStruc->{"FromEmail"} = $attributesByVo->{$vo}->{"FromEmail"};
+	$voStruc->{"ToEmail"} = $attributesByVo->{$vo}->{"ToEmail"};
+	$voStruc->{"Facility"} = $facilityName;
+	$voStruc->{"PerunVOID"} = $attributesByVo->{$vo}->{"PerunVOID"};
+	$voStruc->{"Resources"} = $attributesByVo->{$vo}->{"Resources"};
+	$voStruc->{"Groups"} = $groups;
+	$voStruc->{"Managers"} = $voAdmins;
+
+	#export VO to the JSON file
+	exportVoData $vo, $voStruc;
+}
+
+### NAME: processVoGroups
+###
+### param:  $vo     - id of the vo 
+### return: $groups - array of structured groups
+###-----------------------------------------------------------------------
+### Process the all vo groups and return them in array.
+###-----------------------------------------------------------------------
+sub processVoGroups {
+	my $vo = shift;
+
+	my $groups = [];
+	for my $groupName (keys %{$attributesByVo->{$vo}->{"Groups"}}) {
+		push @$groups,
+		     { 
+		     "Name"      => $groupName,
+		     "Members"   => $attributesByVo->{$vo}->{"Groups"}->{$groupName}->{"Members"},
+		     "Resources" => [ keys %{$attributesByVo->{$vo}->{"Groups"}->{$groupName}->{"Resources"}} ],
+		     }
+	}
+	
+	return $groups;
+}
+
+### NAME: processVoAdmins
+###
+### param:  $vo       - id of the vo 
+### return: $voAdmins - array of structured info about admins of the vo
+###-----------------------------------------------------------------------
+### Process the all vo groups and return them in array.
+###-----------------------------------------------------------------------
+sub processVoAdmins {
+	my $vo = shift;
+
+	#vo ID
+	my $voID = $attributesByVo->{$vo}->{"PerunVOID"};
 	my @specificAttributes = ($A_USER_MAIL,
 	                          $A_USER_LOGIN_EINFRA,
 	                          $A_U_KERBEROS_LOGINS,
 	                          $A_U_SHIBBOLETH_EXT_SOURCES);
-	my @voAdmins = ();
+	my $voAdmins = [];
+	# get all rich admins of the vo
 	my @richAdmins = $vosAgent->getRichAdmins(vo => $voID, role => 'VOADMIN', specificAttributes => \@specificAttributes, allUserAttributes => 0, onlyDirectAdmins => 0,);
 	foreach my $richAdmin (@richAdmins) {
-			#prepare attributes to hash
-			my $adminAttributes = {};
-			foreach my $attribute (@{$richAdmin->{'_userAttributes'}}) {
-				$adminAttributes->{$attribute->{'namespace'} . ':' . $attribute->{'friendlyName'}} = $attribute->{'value'};
-			}
+		#prepare returned attributes to hash for better using
+		my $adminAttributes = {};
+		foreach my $attribute (@{$richAdmin->{'_userAttributes'}}) {
+			$adminAttributes->{$attribute->{'namespace'} . ':' . $attribute->{'friendlyName'}} = $attribute->{'value'};
+		}
 
-			#prepare kerberos logins in required format
-	my @kerberosLogins = ();
-	for my $kerberosLogin (@{$adminAttributes->{$A_U_KERBEROS_LOGINS}}) {
-		my $realm = $kerberosLogin;
-		$realm =~ s/^.*@//;
-		push @kerberosLogins, { "src" => $realm, 
-	                          "id"  => $kerberosLogin, 
-	                        };
+		#prepare kerberos logins in required format
+		my $kerberosLoginsStructure = [];
+		for my $kerberosLogin (@{$adminAttributes->{$A_U_KERBEROS_LOGINS}}) {
+			my $realm = $kerberosLogin;
+			$realm =~ s/^.*@//;
+			push @$kerberosLoginsStructure, { "src" => $realm, "id"  => $kerberosLogin };
+		}
+
+		#prepare shibboleth loggins in required format
+		my $shibbolethLoginsStructure = [];
+		for my $idpIdentifier (keys %{$adminAttributes->{$A_U_SHIBBOLETH_EXT_SOURCES}}) {
+			push @$shibbolethLoginsStructure, { "src" => $idpIdentifier, "id"  => $adminAttributes->{$A_U_SHIBBOLETH_EXT_SOURCES}->{$idpIdentifier} };
+		}
+
+		#add vo admins to the structure
+		push @$voAdmins, 
+		    {
+		      "PerunUserID" => $richAdmin->{'_id'},
+		      "FirstName" => $richAdmin->{'_firstName'} || "",
+		      "LastName" => $richAdmin->{'_lastName'} || "",
+		      "PreferredMail" => $adminAttributes->{$A_USER_MAIL},
+		      "LoginInEINFRA" => defined $adminAttributes->{$A_USER_LOGIN_EINFRA} ? $adminAttributes->{$A_USER_LOGIN_EINFRA}  : "",
+		      "KerberosPrincipals" => $kerberosLoginsStructure,
+		      "ShibbolethPrincipals" => $shibbolethLoginsStructure,
+		    };
 	}
 
-	my @shibbolethLogins = ();
-	for my $idpIdentifier (keys %{$adminAttributes->{$A_U_SHIBBOLETH_EXT_SOURCES}}) {
-		push @shibbolethLogins, { "src" => $idpIdentifier, 
-	                            "id"  => $adminAttributes->{$A_U_SHIBBOLETH_EXT_SOURCES}->{$idpIdentifier},
-	                          };
-	}
+	return $voAdmins;
+}
 
-			push @voAdmins, 
-					{
-						"PerunUserID" => $richAdmin->{'_id'},
-						"FirstName" => $richAdmin->{'_firstName'} || "",
-						"LastName" => $richAdmin->{'_lastName'} || "",
-						"PreferredMail" => $adminAttributes->{$A_USER_MAIL},
-						"LoginInEINFRA" => $adminAttributes->{$A_USER_LOGIN_EINFRA} ? $adminAttributes->{$A_USER_LOGIN_EINFRA}  : "",
-						"KerberosPrincipals" => \@kerberosLogins,
-						"ShibbolethPrincipals" => \@shibbolethLogins,
-					};
-	}
-	#End of structure of VO Admins
-	
-	my @groups = ();
-	for my $groupName (keys %{$attributesByVo{$vo}->{"Groups"}}) {
-		push @groups,
-			 { 
-				 "Name"      => $groupName,
-				 "Members"   => $attributesByVo{$vo}->{"Groups"}->{$groupName}->{"Members"},
-				 #"Resources" => \@resources,
-				 "Resources" => [ keys %{$attributesByVo{$vo}->{"Groups"}->{$groupName}->{"Resources"}} ],
-			 }
-	}
-
-	my $voStruc = {};
-	$voStruc->{"FileType"} = "du_vo_export";
-	$voStruc->{"Name"} = $vo;
-	$voStruc->{"LongName"} = $attributesByVo{$vo}->{"PerunVOLongName"};
-	$voStruc->{"FromEmail"} = $attributesByVo{$vo}->{"FromEmail"};
-	$voStruc->{"ToEmail"} = $attributesByVo{$vo}->{"ToEmail"};
-	$voStruc->{"Facility"} = $facilityName;
-	$voStruc->{"PerunVOID"} = $attributesByVo{$vo}->{"PerunVOID"};
-	$voStruc->{"Resources"} = $attributesByVo{$vo}->{"Resources"};
-	$voStruc->{"Groups"} = \@groups;
-	$voStruc->{"Managers"} = \@voAdmins;
+### NAME: exportVoData
+###
+### param: $vo      - id of the vo
+### param: $voStruc - structured info about the vo to export it
+###-----------------------------------------------------------------------
+### Export data about the vo to the JSON file.
+###-----------------------------------------------------------------------
+sub exportVoData {
+	my $vo = shift;
+	my $voStruc = shift;
 
 	my $fileName = "$DIRECTORY/data/$facilityName-$vo";
 	open FILE,">$fileName" or die "Cannot open $fileName: $! \n";
 	print FILE JSON::XS->new->utf8->pretty->encode($voStruc);
 	close FILE;
+
 }
+
+### NAME: exportFacilityData
+###-----------------------------------------------------------------------
+### Export data about all allowed users on facility to the JSON file.
+###-----------------------------------------------------------------------
+sub exportFacilityData {
+	my $struc = {};
+	$struc->{"FileType"} = $SERVICE_NAME;
+	my @users = values %$attributesByLogin;
+	$struc->{"Users"} = \@users;
+	
+	my $fileName = "$DIRECTORY/data/$facilityName-$SERVICE_NAME";
+
+	open FILE,">$fileName" or die "Cannot open $fileName: $! \n";
+	print FILE JSON::XS->new->utf8->pretty->encode($struc);
+	close FILE;
+}
+
+#-------------------------------------------------------------------------
+#---------------------------Main code-------------------------------------
+#-------------------------------------------------------------------------
+
+#get all reasources for the facility
+my @resources = $facilitiesAgent->getAssignedResources( facility => $facilityId );
+foreach my $resource ( @resources ) {
+	processResource $resource;
+}
+
+#vo specific settings
+for my $vo (keys %$attributesByVo) {
+	processVo $vo;
+}
+
+exportFacilityData;
 
 perunServicesInit::finalize;
